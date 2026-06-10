@@ -1,20 +1,33 @@
-from max_chatbot_python import GreenAPIBot, Notification
+import asyncio
+import logging
 import sqlite3
 import math
-import requests
 
-# ========== НАСТРОЙКИ ==========
-ID_INSTANCE = "3100644334"
-API_TOKEN = "2b317f072c24487a87ab9f1d1d51d2c831918c4368884eef97"
+from maxapi import Bot, Dispatcher
+from maxapi.types import (
+    BotStarted,
+    MessageCreated,
+    CallbackButton,
+    ButtonsPayload,
+    Attachment,
+    MessageCallback,
+)
+from maxapi.filters.command import CommandStart
 
-# ========== ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ==========
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = "f9LHodD0cOJEg9h4yFIJR37KNWS9FchffAw-rNlVkZ99uoninEOoiBeTgLbs43WufAX-dt5H4JPiqFNDmnTA"
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+# ---------------------------------------------------------------------------
+# База данных
+# ---------------------------------------------------------------------------
 conn = sqlite3.connect('wifi_points.db', check_same_thread=False)
 cursor = conn.cursor()
-
-# Создаём таблицу
-cursor.execute('DROP TABLE IF EXISTS wifi_spots')
 cursor.execute('''
-CREATE TABLE wifi_spots (
+CREATE TABLE IF NOT EXISTS wifi_spots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
     address TEXT,
@@ -26,23 +39,29 @@ CREATE TABLE wifi_spots (
 ''')
 conn.commit()
 
-# Добавляем тестовые точки
-test_spots = [
-    ("Библиотека им. Ленина", "ул. Воздвиженка, 3/5", 55.751244, 37.618423, "", "Сеть Moscow_WiFi без пароля"),
-    ("ТЦ Европейский", "пл. Киевского Вокзала, 2", 55.744364, 37.566161, "euro_free", "Пароль: euro_free"),
-    ("Кафе Кофеин", "ул. Тверская, 15", 55.765873, 37.605837, "cafein123", "Пароль: cafein123"),
-]
+cursor.execute('SELECT COUNT(*) FROM wifi_spots')
+if cursor.fetchone()[0] == 0:
+    test_spots = [
+        ("Библиотека им. Ленина", "ул. Воздвиженка, 3/5", 55.751244, 37.618423, "", "Сеть Moscow_WiFi без пароля"),
+        ("ТЦ Европейский", "пл. Киевского Вокзала, 2", 55.744364, 37.566161, "euro_free", "Пароль: euro_free"),
+        ("Кафе Кофеин", "ул. Тверская, 15", 55.765873, 37.605837, "cafein123", "Пароль: cafein123"),
+        ("Макдоналдс", "ул. Арбат, 42", 55.750341, 37.590527, "", "Бесплатный Wi-Fi"),
+        ("Коворкинг Старт", "пер. Хохловский, 5", 55.757623, 37.639546, "start123", "Пароль: start123"),
+    ]
+    for spot in test_spots:
+        cursor.execute(
+            'INSERT INTO wifi_spots (name, address, latitude, longitude, password, instructions) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            spot
+        )
+    conn.commit()
+    print(f"Загружено тестовых точек: {len(test_spots)}")
 
-for spot in test_spots:
-    cursor.execute(
-        'INSERT INTO wifi_spots (name, address, latitude, longitude, password, instructions) VALUES (?, ?, ?, ?, ?, ?)',
-        spot)
-conn.commit()
+print(f"Точек в базе: {cursor.execute('SELECT COUNT(*) FROM wifi_spots').fetchone()[0]}")
 
-print("Загружено точек: " + str(len(test_spots)))
-
-
-# ========== ФУНКЦИЯ РАСЧЁТА РАССТОЯНИЯ ==========
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
 def calculate_distance(lat1, lon1, lat2, lon2):
     R = 6371
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
@@ -52,166 +71,217 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.asin(math.sqrt(a))
     return round(R * c, 2)
 
-
-# ========== ПОИСК БЛИЖАЙШИХ ТОЧЕК ==========
 def find_nearest_spots(user_lat, user_lon, limit=5):
     cursor.execute('SELECT name, address, latitude, longitude, password, instructions FROM wifi_spots')
     spots = cursor.fetchall()
     spots_with_distance = []
-    for spot in spots:
-        name, address, lat, lon, password, instructions = spot
+    for name, address, lat, lon, password, instructions in spots:
         distance = calculate_distance(user_lat, user_lon, lat, lon)
         spots_with_distance.append((distance, name, address, lat, lon, password, instructions))
     spots_with_distance.sort(key=lambda x: x[0])
     return spots_with_distance[:limit]
 
+def get_all_spots():
+    cursor.execute('SELECT name, address, password, instructions FROM wifi_spots')
+    return cursor.fetchall()
 
-# ========== ОТПРАВКА КНОПКИ ==========
-def send_location_button(notification):
-    chat_id = notification.event.get('senderData', {}).get('chatId', '')
-
-    url = f"https://3100.api.green-api.com/waInstance{ID_INSTANCE}/sendButtons/{API_TOKEN}"
-
-    payload = {
-        "chatId": chat_id,
-        "message": "Нажмите на кнопку и отправьте ваше местоположение, чтобы найти ближайший Wi-Fi:",
-        "buttons": [
-            {
-                "buttonId": "request_location",
-                "buttonText": "Отправить местоположение"
-            }
-        ]
-    }
-
-    headers = {'Content-Type': 'application/json'}
-
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        if response.status_code != 200:
-            notification.answer("Чтобы найти Wi-Fi рядом, отправьте мне ваше местоположение через кнопку вложения.")
-    except Exception as e:
-        print("Ошибка при отправке кнопки: " + str(e))
-
-
-# ========== ФОРМИРОВАНИЕ ОТВЕТА ==========
 def format_spots_message(spots):
     if not spots:
         return "Рядом нет сохранённых Wi-Fi точек."
-
     message = "Ближайшие точки Wi-Fi:\n\n"
     for i, spot in enumerate(spots, 1):
         distance, name, address, lat, lon, password, instructions = spot
-        message = message + str(i) + ". " + name + "\n"
-        message = message + "   Адрес: " + address + "\n"
-        message = message + "   Расстояние: " + str(distance) + " км\n"
+        message += f"{i}. {name}\n"
+        message += f"   Адрес: {address}\n"
+        message += f"   Расстояние: {distance} км\n"
         if password:
-            message = message + "   Пароль: " + password + "\n"
-        message = message + "   " + instructions + "\n\n"
+            message += f"   Пароль: {password}\n"
+        message += f"   Инструкция: {instructions}\n\n"
+    first_lat, first_lon = spots[0][3], spots[0][4]
+    message += f"Открыть на Яндекс.Картах: https://yandex.ru/maps/?text={first_lat},{first_lon}"
     return message
 
+def format_all_spots_message(spots):
+    if not spots:
+        return "База данных пуста."
+    message = "Список всех Wi-Fi точек:\n\n"
+    for i, spot in enumerate(spots, 1):
+        name, address, password, instructions = spot
+        message += f"{i}. {name}\n"
+        message += f"   Адрес: {address}\n"
+        if password:
+            message += f"   Пароль: {password}\n"
+        message += f"   Инструкция: {instructions}\n\n"
+    return message
 
-# ========== ОСНОВНАЯ ЛОГИКА ==========
-bot = GreenAPIBot(ID_INSTANCE, API_TOKEN)
+def get_chat_id(event):
+    if hasattr(event, 'chat') and hasattr(event.chat, 'chat_id'):
+        return event.chat.chat_id
+    if hasattr(event, 'message') and hasattr(event.message, 'recipient') and hasattr(event.message.recipient, 'chat_id'):
+        return event.message.recipient.chat_id
+    raise AttributeError(f"Не удалось извлечь chat_id из {type(event).__name__}")
 
+# ---------------------------------------------------------------------------
+# Клавиатуры
+# ---------------------------------------------------------------------------
+def build_main_menu():
+    buttons = [
+        [CallbackButton(text="Список Wi-Fi точек", payload="list_spots")],
+        [CallbackButton(text="Карта Wi-Fi точек", payload="map_spots")],
+        [CallbackButton(text="Проблемы с сетью", payload="problem")],
+        [CallbackButton(text="Предложить Wi-Fi точку", payload="suggest")],
+        [CallbackButton(text="Инструкция по подключению", payload="manual")],
+    ]
+    payload = ButtonsPayload(buttons=buttons)
+    return Attachment(type="inline_keyboard", payload=payload)
 
-@bot.router.message()
-def handle_message(notification: Notification):
-    try:
-        # Получаем текст сообщения
-        message_data = notification.event.get('messageData', {})
-        message_text = message_data.get('textMessageData', {}).get('textMessage', '')
-        message_lower = message_text.lower().strip()
+def build_back_button():
+    buttons = [[CallbackButton(text="Назад в главное меню", payload="main_menu")]]
+    payload = ButtonsPayload(buttons=buttons)
+    return Attachment(type="inline_keyboard", payload=payload)
 
-        # Команда /start
-        if message_lower == '/start':
-            notification.answer(
-                "Здравствуйте! Я бот для поиска бесплатного Wi-Fi.\n\n"
-                "Нажмите на кнопку ниже и отправьте ваше местоположение, "
-                "я покажу ближайшие точки доступа с паролями."
+# ---------------------------------------------------------------------------
+# Обработчики событий
+# ---------------------------------------------------------------------------
+@dp.bot_started()
+async def on_bot_started(event: BotStarted):
+    chat_id = get_chat_id(event)
+    await bot.send_message(
+        chat_id=chat_id,
+        text="Привет! Я чат-бот общедоступных Wi-Fi точек.\n\n"
+             "Я могу помочь вам:\n"
+             "- найти общедоступные Wi-Fi точки\n"
+             "- сообщить о проблеме с сетью\n"
+             "- предложить новую Wi-Fi точку\n"
+             "- узнать, как подключиться к Wi-Fi точкам\n\n"
+             "Если что-то пойдёт не так, просто отправьте команду /start.",
+        attachments=[build_main_menu()]
+    )
+
+@dp.message_created(CommandStart())
+async def cmd_start(event: MessageCreated):
+    await event.message.answer(
+        "Главное меню:",
+        attachments=[build_main_menu()]
+    )
+
+@dp.message_callback()
+async def handle_callback(event: MessageCallback):
+    data = event.callback.payload
+
+    if data == "list_spots":
+        spots = get_all_spots()
+        if spots:
+            await event.message.answer(format_all_spots_message(spots))
+        else:
+            await event.message.answer("База данных пуста.")
+        # Кнопка назад
+        await event.message.answer("Вы можете вернуться в главное меню.", attachments=[build_back_button()])
+
+    elif data == "map_spots":
+        await event.message.answer(
+            "Отправьте мне вашу геолокацию (через значок скрепки в поле ввода), и я покажу ближайшие точки на карте.",
+            attachments=[build_back_button()]
+        )
+
+    elif data == "problem":
+        await event.message.answer(
+            "Если у вас возникли проблемы с подключением к Wi-Fi точке, опишите ситуацию в ответном сообщении. "
+            "Мы передадим информацию администратору.",
+            attachments=[build_back_button()]
+        )
+
+    elif data == "suggest":
+        await event.message.answer(
+            "Чтобы предложить новую Wi-Fi точку, напишите её адрес, название и (если знаете) пароль. "
+            "Мы рассмотрим ваше предложение!",
+            attachments=[build_back_button()]
+        )
+
+    elif data == "manual":
+        await event.message.answer(
+            "Инструкция по подключению:\n\n"
+            "1. Включите Wi-Fi на устройстве.\n"
+            "2. Найдите сеть с названием, указанным в списке точек.\n"
+            "3. Если сеть защищена, введите пароль (также указан в списке).\n"
+            "4. Подключитесь и пользуйтесь интернетом!\n\n"
+            "Если сеть открытая, пароль не требуется.",
+            attachments=[build_back_button()]
+        )
+
+    elif data == "main_menu":
+        await event.message.answer(
+            "Главное меню:",
+            attachments=[build_main_menu()]
+        )
+
+    await event.answer()
+
+@dp.message_created()
+async def handle_all_messages(event: MessageCreated):
+    chat_id = get_chat_id(event)
+    message_body = event.message.body
+
+    # Попытка извлечь координаты из геолокации
+    user_lat = user_lon = None
+    if hasattr(message_body, 'location') and message_body.location is not None:
+        loc = message_body.location
+        if hasattr(loc, 'latitude'):
+            user_lat, user_lon = loc.latitude, loc.longitude
+        elif isinstance(loc, dict):
+            user_lat, user_lon = loc.get('latitude'), loc.get('longitude')
+
+    if not user_lat and hasattr(message_body, 'attachments'):
+        for att in message_body.attachments:
+            if getattr(att, 'type', '') == 'location':
+                payload = getattr(att, 'payload', None)
+                if payload:
+                    if hasattr(payload, 'latitude'):
+                        user_lat, user_lon = payload.latitude, payload.longitude
+                    elif isinstance(payload, dict):
+                        user_lat, user_lon = payload.get('latitude'), payload.get('longitude')
+                break
+
+    if user_lat and user_lon:
+        print(f"Получена геолокация: {user_lat}, {user_lon}")
+        nearest = find_nearest_spots(user_lat, user_lon)
+        if not nearest:
+            await event.message.answer("Рядом нет сохранённых Wi-Fi точек.")
+        else:
+            await event.message.answer(format_spots_message(nearest))
+            try:
+                await bot.send_location(chat_id=chat_id, latitude=nearest[0][3], longitude=nearest[0][4])
+            except Exception as e:
+                print(f"Ошибка отправки локации: {e}")
+        # Кнопка назад после результата
+        await event.message.answer("Вернуться в главное меню:", attachments=[build_back_button()])
+        return
+
+    # Текстовые сообщения
+    if hasattr(message_body, 'text') and message_body.text:
+        text = message_body.text.strip()
+        if text in ('/start', '/help'):
+            await event.message.answer(
+                "Главное меню:",
+                attachments=[build_main_menu()]
             )
-            send_location_button(notification)
             return
+        # Все остальные тексты (жалобы, предложения и т.п.)
+        await event.message.answer(
+            "Спасибо за сообщение! Если вы хотите вернуться в главное меню, нажмите кнопку ниже.",
+            attachments=[build_main_menu()]
+        )
 
-        # Команда /help
-        if message_lower == '/help':
-            notification.answer(
-                "Справка по командам:\n\n"
-                "/start - начать работу\n"
-                "/help - показать справку\n"
-                "/spots - список всех точек Wi-Fi\n\n"
-                "Чтобы найти Wi-Fi рядом, отправьте ваше местоположение."
-            )
-            return
+# ---------------------------------------------------------------------------
+# Запуск
+# ---------------------------------------------------------------------------
+async def main():
+    print("=" * 50)
+    print("Wi-Fi бот для MAX запущен")
+    print(f"Точек в базе: {cursor.execute('SELECT COUNT(*) FROM wifi_spots').fetchone()[0]}")
+    print("=" * 50)
+    await bot.delete_webhook()
+    await dp.start_polling(bot)
 
-        # Команда /spots - все точки
-        if message_lower == '/spots':
-            cursor.execute('SELECT name, address, latitude, longitude, password, instructions FROM wifi_spots')
-            all_spots = cursor.fetchall()
-
-            if not all_spots:
-                notification.answer("База данных пуста. Добавьте точки вручную.")
-                return
-
-            message = "Список всех Wi-Fi точек:\n\n"
-            for i, spot in enumerate(all_spots, 1):
-                name, address, lat, lon, password, instructions = spot
-                message = message + str(i) + ". " + name + "\n"
-                message = message + "   Адрес: " + address + "\n"
-                if password:
-                    message = message + "   Пароль: " + password + "\n"
-                message = message + "   " + instructions + "\n\n"
-
-            notification.answer(message)
-            return
-
-        # Обработка геолокации
-        if message_data.get('typeMessage') == 'locationMessage':
-            location_data = message_data.get('locationMessageData', {})
-            user_lat = location_data.get('latitude')
-            user_lon = location_data.get('longitude')
-
-            print("Получена геолокация: " + str(user_lat) + ", " + str(user_lon))
-
-            if user_lat and user_lon:
-                nearest_spots = find_nearest_spots(user_lat, user_lon)
-
-                if nearest_spots:
-                    text_message = format_spots_message(nearest_spots)
-                    nearest = nearest_spots[0]
-                    notification.answer(
-                        text_message,
-                        latitude=nearest[3],
-                        longitude=nearest[4]
-                    )
-                else:
-                    notification.answer("К сожалению, рядом нет сохранённых Wi-Fi точек.")
-            else:
-                notification.answer("Не удалось определить ваше местоположение. Попробуйте ещё раз.")
-            return
-
-        # Ответ на непонятное сообщение
-        if message_text and not message_lower.startswith('/'):
-            notification.answer(
-                "Я вас не понял. Отправьте команду /start, чтобы начать работу, "
-                "или просто отправьте ваше местоположение."
-            )
-            return
-
-    except Exception as e:
-        print("Ошибка: " + str(e))
-        try:
-            notification.answer("Произошла ошибка. Попробуйте позже.")
-        except:
-            pass
-
-
-# ========== ЗАПУСК ==========
-print("=" * 40)
-print("Wi-Fi бот для MAX запущен")
-print("Инстанс: " + ID_INSTANCE)
-print("Точек в базе: " + str(cursor.execute('SELECT COUNT(*) FROM wifi_spots').fetchone()[0]))
-print("=" * 40)
-print("Бот отправляет кнопки и ищет Wi-Fi по геолокации")
-print("=" * 40)
-
-bot.run_forever()
+if __name__ == '__main__':
+    asyncio.run(main())
