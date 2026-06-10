@@ -16,7 +16,7 @@ from maxapi.filters.command import CommandStart
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "f9LHodD0cOJEg9h4yFIJR37KNWS9FchffAw-rNlVkZ99uoninEOoiBeTgLbs43WufAX-dt5H4JPiqFNDmnTA"
+BOT_TOKEN = ""
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
