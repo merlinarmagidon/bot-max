@@ -8,6 +8,7 @@ from maxapi.types import (
     BotStarted,
     MessageCreated,
     CallbackButton,
+    LinkButton,
     ButtonsPayload,
     Attachment,
     MessageCallback,
@@ -39,80 +40,14 @@ CREATE TABLE IF NOT EXISTS wifi_spots (
 ''')
 conn.commit()
 
-cursor.execute('SELECT COUNT(*) FROM wifi_spots')
-if cursor.fetchone()[0] == 0:
-    test_spots = [
-        ("Библиотека им. Ленина", "ул. Воздвиженка, 3/5", 55.751244, 37.618423, "", "Сеть Moscow_WiFi без пароля"),
-        ("ТЦ Европейский", "пл. Киевского Вокзала, 2", 55.744364, 37.566161, "euro_free", "Пароль: euro_free"),
-        ("Кафе Кофеин", "ул. Тверская, 15", 55.765873, 37.605837, "cafein123", "Пароль: cafein123"),
-        ("Макдоналдс", "ул. Арбат, 42", 55.750341, 37.590527, "", "Бесплатный Wi-Fi"),
-        ("Коворкинг Старт", "пер. Хохловский, 5", 55.757623, 37.639546, "start123", "Пароль: start123"),
-    ]
-    for spot in test_spots:
-        cursor.execute(
-            'INSERT INTO wifi_spots (name, address, latitude, longitude, password, instructions) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            spot
-        )
-    conn.commit()
-    print(f"Загружено тестовых точек: {len(test_spots)}")
-
 print(f"Точек в базе: {cursor.execute('SELECT COUNT(*) FROM wifi_spots').fetchone()[0]}")
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
-def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371
-    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    c = 2 * math.asin(math.sqrt(a))
-    return round(R * c, 2)
-
-def find_nearest_spots(user_lat, user_lon, limit=5):
-    cursor.execute('SELECT name, address, latitude, longitude, password, instructions FROM wifi_spots')
-    spots = cursor.fetchall()
-    spots_with_distance = []
-    for name, address, lat, lon, password, instructions in spots:
-        distance = calculate_distance(user_lat, user_lon, lat, lon)
-        spots_with_distance.append((distance, name, address, lat, lon, password, instructions))
-    spots_with_distance.sort(key=lambda x: x[0])
-    return spots_with_distance[:limit]
-
 def get_all_spots():
     cursor.execute('SELECT name, address, password, instructions FROM wifi_spots')
     return cursor.fetchall()
-
-def format_spots_message(spots):
-    if not spots:
-        return "Рядом нет сохранённых Wi-Fi точек."
-    message = "Ближайшие точки Wi-Fi:\n\n"
-    for i, spot in enumerate(spots, 1):
-        distance, name, address, lat, lon, password, instructions = spot
-        message += f"{i}. {name}\n"
-        message += f"   Адрес: {address}\n"
-        message += f"   Расстояние: {distance} км\n"
-        if password:
-            message += f"   Пароль: {password}\n"
-        message += f"   Инструкция: {instructions}\n\n"
-    first_lat, first_lon = spots[0][3], spots[0][4]
-    message += f"Открыть на Яндекс.Картах: https://yandex.ru/maps/?text={first_lat},{first_lon}"
-    return message
-
-def format_all_spots_message(spots):
-    if not spots:
-        return "База данных пуста."
-    message = "Список всех Wi-Fi точек:\n\n"
-    for i, spot in enumerate(spots, 1):
-        name, address, password, instructions = spot
-        message += f"{i}. {name}\n"
-        message += f"   Адрес: {address}\n"
-        if password:
-            message += f"   Пароль: {password}\n"
-        message += f"   Инструкция: {instructions}\n\n"
-    return message
 
 def get_chat_id(event):
     if hasattr(event, 'chat') and hasattr(event.chat, 'chat_id'):
@@ -122,20 +57,41 @@ def get_chat_id(event):
     raise AttributeError(f"Не удалось извлечь chat_id из {type(event).__name__}")
 
 # ---------------------------------------------------------------------------
-# Клавиатуры
+# Клавиатуры и константы
 # ---------------------------------------------------------------------------
+MAP_URL = (
+    "http://gis.gmolo.ru:8081/#projectId=16&cameraMode=map"
+    "&backgroundColor=F2F2F2&layers=66eeb5ud80000u"
+    "&map=12.257798/59.560297/30.097306/0.000000/0.000000"
+    "&EXT_CLIENT_ID=3fcd6630-18c2-48df-85b8-93f669775f22"
+)
+
+PAGE_SIZE = 5
+
 def build_main_menu():
     buttons = [
         [CallbackButton(text="Список Wi-Fi точек", payload="list_spots")],
-        [CallbackButton(text="Карта Wi-Fi точек", payload="map_spots")],
-        [CallbackButton(text="Проблемы с сетью", payload="problem")],
-        [CallbackButton(text="Предложить Wi-Fi точку", payload="suggest")],
+        [LinkButton(text="Карта Wi-Fi точек", url=MAP_URL)],
         [CallbackButton(text="Инструкция по подключению", payload="manual")],
     ]
     payload = ButtonsPayload(buttons=buttons)
     return Attachment(type="inline_keyboard", payload=payload)
 
-def build_back_button():
+def build_pagination_keyboard(page: int, total_pages: int):
+    buttons = []
+    nav_row = []
+    if page > 1:
+        nav_row.append(CallbackButton(text="◀ Назад", payload=f"page_{page-1}"))
+    nav_row.append(CallbackButton(text=f"Стр. {page}/{total_pages}", payload="noop"))
+    if page < total_pages:
+        nav_row.append(CallbackButton(text="Далее ▶", payload=f"page_{page+1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([CallbackButton(text="Назад в главное меню", payload="main_menu")])
+    payload = ButtonsPayload(buttons=buttons)
+    return Attachment(type="inline_keyboard", payload=payload)
+
+def build_back_only_keyboard():
     buttons = [[CallbackButton(text="Назад в главное меню", payload="main_menu")]]
     payload = ButtonsPayload(buttons=buttons)
     return Attachment(type="inline_keyboard", payload=payload)
@@ -150,10 +106,9 @@ async def on_bot_started(event: BotStarted):
         chat_id=chat_id,
         text="Привет! Я чат-бот общедоступных Wi-Fi точек.\n\n"
              "Я могу помочь вам:\n"
-             "- найти общедоступные Wi-Fi точки\n"
-             "- сообщить о проблеме с сетью\n"
-             "- предложить новую Wi-Fi точку\n"
-             "- узнать, как подключиться к Wi-Fi точкам\n\n"
+             "- найти список Wi-Fi точек\n"
+             "- открыть карту с точками\n"
+             "- узнать, как подключиться к Wi-Fi\n\n"
              "Если что-то пойдёт не так, просто отправьте команду /start.",
         attachments=[build_main_menu()]
     )
@@ -169,95 +124,117 @@ async def cmd_start(event: MessageCreated):
 async def handle_callback(event: MessageCallback):
     data = event.callback.payload
 
-    if data == "list_spots":
+    if data.startswith("page_"):
+        try:
+            page = int(data.split("_")[1])
+        except (IndexError, ValueError):
+            return
+
         spots = get_all_spots()
-        if spots:
-            await event.message.answer(format_all_spots_message(spots))
-        else:
+        total_pages = max(1, math.ceil(len(spots) / PAGE_SIZE))
+        if page < 1 or page > total_pages:
+            return
+
+        start_idx = (page - 1) * PAGE_SIZE
+        end_idx = min(page * PAGE_SIZE, len(spots))
+        group = spots[start_idx:end_idx]
+
+        msg = f"Список Wi-Fi точек (с {start_idx+1} по {end_idx}):\n\n"
+        for i, spot in enumerate(group, start_idx+1):
+            name, address, password, instructions = spot
+            msg += f"{i}. {name}\n"
+            msg += f"   Адрес: {address}\n"
+            if password:
+                msg += f"   Пароль: {password}\n"
+            msg += f"   Инструкция: {instructions}\n\n"
+
+        # Редактируем текущее сообщение вместо удаления и отправки нового
+        try:
+            await event.message.edit(
+                text=msg,
+                attachments=[build_pagination_keyboard(page, total_pages)]
+            )
+        except Exception:
+            # fallback: если edit не работает, отправляем новое (но с очисткой)
+            try:
+                await event.message.delete()
+            except Exception:
+                pass
+            await event.message.answer(msg, attachments=[build_pagination_keyboard(page, total_pages)])
+
+    elif data == "list_spots":
+        spots = get_all_spots()
+        if not spots:
             await event.message.answer("База данных пуста.")
-        # Кнопка назад
-        await event.message.answer("Вы можете вернуться в главное меню.", attachments=[build_back_button()])
+            return
 
-    elif data == "map_spots":
-        await event.message.answer(
-            "Отправьте мне вашу геолокацию (через значок скрепки в поле ввода), и я покажу ближайшие точки на карте.",
-            attachments=[build_back_button()]
-        )
+        total_pages = max(1, math.ceil(len(spots) / PAGE_SIZE))
+        start_idx = 0
+        end_idx = min(PAGE_SIZE, len(spots))
+        group = spots[start_idx:end_idx]
 
-    elif data == "problem":
-        await event.message.answer(
-            "Если у вас возникли проблемы с подключением к Wi-Fi точке, опишите ситуацию в ответном сообщении. "
-            "Мы передадим информацию администратору.",
-            attachments=[build_back_button()]
-        )
+        msg = f"Список Wi-Fi точек (с 1 по {end_idx}):\n\n"
+        for i, spot in enumerate(group, 1):
+            name, address, password, instructions = spot
+            msg += f"{i}. {name}\n"
+            msg += f"   Адрес: {address}\n"
+            if password:
+                msg += f"   Пароль: {password}\n"
+            msg += f"   Инструкция: {instructions}\n\n"
 
-    elif data == "suggest":
-        await event.message.answer(
-            "Чтобы предложить новую Wi-Fi точку, напишите её адрес, название и (если знаете) пароль. "
-            "Мы рассмотрим ваше предложение!",
-            attachments=[build_back_button()]
-        )
+        try:
+            await event.message.edit(
+                text=msg,
+                attachments=[build_pagination_keyboard(1, total_pages)]
+            )
+        except Exception:
+            try:
+                await event.message.delete()
+            except Exception:
+                pass
+            await event.message.answer(msg, attachments=[build_pagination_keyboard(1, total_pages)])
 
     elif data == "manual":
-        await event.message.answer(
-            "Инструкция по подключению:\n\n"
-            "1. Включите Wi-Fi на устройстве.\n"
-            "2. Найдите сеть с названием, указанным в списке точек.\n"
-            "3. Если сеть защищена, введите пароль (также указан в списке).\n"
-            "4. Подключитесь и пользуйтесь интернетом!\n\n"
-            "Если сеть открытая, пароль не требуется.",
-            attachments=[build_back_button()]
-        )
+        try:
+            await event.message.edit(
+                text="Инструкция по подключению:\n\n"
+                     "1. Включите Wi-Fi на устройстве.\n"
+                     "2. Найдите сеть с названием, указанным в списке точек.\n"
+                     "3. Если сеть защищена, введите пароль (также указан в списке).\n"
+                     "4. Подключитесь и пользуйтесь интернетом!\n\n"
+                     "Если сеть открытая, пароль не требуется.",
+                attachments=[build_back_only_keyboard()]
+            )
+        except Exception:
+            await event.message.answer(
+                "Инструкция по подключению:\n\n"
+                "1. Включите Wi-Fi на устройстве.\n"
+                "2. Найдите сеть с названием, указанным в списке точек.\n"
+                "3. Если сеть защищена, введите пароль (также указан в списке).\n"
+                "4. Подключитесь и пользуйтесь интернетом!\n\n"
+                "Если сеть открытая, пароль не требуется.",
+                attachments=[build_back_only_keyboard()]
+            )
 
     elif data == "main_menu":
-        await event.message.answer(
-            "Главное меню:",
-            attachments=[build_main_menu()]
-        )
-
-    await event.answer()
+        try:
+            await event.message.edit(
+                text="Главное меню:",
+                attachments=[build_main_menu()]
+            )
+        except Exception:
+            try:
+                await event.message.delete()
+            except Exception:
+                pass
+            await event.message.answer(
+                "Главное меню:",
+                attachments=[build_main_menu()]
+            )
 
 @dp.message_created()
 async def handle_all_messages(event: MessageCreated):
-    chat_id = get_chat_id(event)
     message_body = event.message.body
-
-    # Попытка извлечь координаты из геолокации
-    user_lat = user_lon = None
-    if hasattr(message_body, 'location') and message_body.location is not None:
-        loc = message_body.location
-        if hasattr(loc, 'latitude'):
-            user_lat, user_lon = loc.latitude, loc.longitude
-        elif isinstance(loc, dict):
-            user_lat, user_lon = loc.get('latitude'), loc.get('longitude')
-
-    if not user_lat and hasattr(message_body, 'attachments'):
-        for att in message_body.attachments:
-            if getattr(att, 'type', '') == 'location':
-                payload = getattr(att, 'payload', None)
-                if payload:
-                    if hasattr(payload, 'latitude'):
-                        user_lat, user_lon = payload.latitude, payload.longitude
-                    elif isinstance(payload, dict):
-                        user_lat, user_lon = payload.get('latitude'), payload.get('longitude')
-                break
-
-    if user_lat and user_lon:
-        print(f"Получена геолокация: {user_lat}, {user_lon}")
-        nearest = find_nearest_spots(user_lat, user_lon)
-        if not nearest:
-            await event.message.answer("Рядом нет сохранённых Wi-Fi точек.")
-        else:
-            await event.message.answer(format_spots_message(nearest))
-            try:
-                await bot.send_location(chat_id=chat_id, latitude=nearest[0][3], longitude=nearest[0][4])
-            except Exception as e:
-                print(f"Ошибка отправки локации: {e}")
-        # Кнопка назад после результата
-        await event.message.answer("Вернуться в главное меню:", attachments=[build_back_button()])
-        return
-
-    # Текстовые сообщения
     if hasattr(message_body, 'text') and message_body.text:
         text = message_body.text.strip()
         if text in ('/start', '/help'):
@@ -266,9 +243,8 @@ async def handle_all_messages(event: MessageCreated):
                 attachments=[build_main_menu()]
             )
             return
-        # Все остальные тексты (жалобы, предложения и т.п.)
         await event.message.answer(
-            "Спасибо за сообщение! Если вы хотите вернуться в главное меню, нажмите кнопку ниже.",
+            "Используйте кнопки в главном меню. Если вы хотите вернуться, нажмите /start.",
             attachments=[build_main_menu()]
         )
 
