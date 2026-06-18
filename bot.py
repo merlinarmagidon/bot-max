@@ -2,6 +2,9 @@ import asyncio
 import logging
 import sqlite3
 import math
+import re
+import os
+from dotenv import load_dotenv
 
 from maxapi import Bot, Dispatcher
 from maxapi.types import (
@@ -17,10 +20,13 @@ from maxapi.filters.command import CommandStart
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "f9LHodD0cOJEg9h4yFIJR37KNWS9FchffAw-rNlVkZ99uoninEOoiBeTgLbs43WufAX-dt5H4JPiqFNDmnTA"
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в .env")
 
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher()          # ← эта строка была потеряна
 
 # ---------------------------------------------------------------------------
 # База данных
@@ -68,10 +74,19 @@ MAP_URL = (
 
 PAGE_SIZE = 5
 
+WELCOME_TEXT = (
+    "Привет! Я чат-бот общедоступных Wi-Fi точек.\n\n"
+    "Я могу помочь вам:\n"
+    "- открыть карту с точками\n"
+    "- найти список Wi-Fi точек\n"
+    "- узнать, как подключиться к Wi-Fi\n\n"
+    "Если что-то пойдёт не так, просто отправьте команду /start."
+)
+
 def build_main_menu():
     buttons = [
-        [CallbackButton(text="Список Wi-Fi точек", payload="list_spots")],
         [LinkButton(text="Карта Wi-Fi точек", url=MAP_URL)],
+        [CallbackButton(text="Список Wi-Fi точек", payload="list_spots")],
         [CallbackButton(text="Инструкция по подключению", payload="manual")],
     ]
     payload = ButtonsPayload(buttons=buttons)
@@ -97,6 +112,80 @@ def build_back_only_keyboard():
     return Attachment(type="inline_keyboard", payload=payload)
 
 # ---------------------------------------------------------------------------
+# Очистка и форматирование
+# ---------------------------------------------------------------------------
+REMOVE_PHRASES = [
+    r'Доступная\s+для\s+подключения\s*(?:\([^)]*\))?\s*',
+    r'Открытая\s+сеть\s*(?:\([^)]*\))?\s*',
+    r'Общественное\s+пространство\s*',
+    r'Остановки\s+общ\.?\s*транспорта\s*',
+    r'Соц\.?\s*объекты\s*',
+    r'Доступна\s+авторизация\s+через\s+ГосУслуги\s*,?\s*',
+]
+
+def remove_junk_phrases(text: str) -> str:
+    for phrase in REMOVE_PHRASES:
+        text = re.sub(phrase, '', text, flags=re.IGNORECASE)
+    return text.strip()
+
+def clean_field(field: str) -> str:
+    if not field:
+        return ""
+    field = re.sub(r'\(.*?\)', '', field)
+    field = re.sub(r',\s*\d+\s*$', '', field)
+    field = remove_junk_phrases(field)
+    field = field.strip().strip(',;').strip()
+    field = re.sub(r',\s*,', ',', field)
+    field = re.sub(r'\s{2,}', ' ', field)
+    field = re.sub(r'[«»""]', '', field)
+    field = field.strip().strip(',;').strip()
+    return field
+
+def contains_house_number(text: str) -> bool:
+    return bool(re.search(r'[а-яё\s]+,\s*\d+[а-я]?', text, re.IGNORECASE))
+
+def extract_address_and_name(name: str, address: str, password: str):
+    addr = clean_field(address)
+    nm = clean_field(name) if name and name.strip() else ""
+    nm = re.sub(r'[«»""]', '', nm)
+
+    if addr and not contains_house_number(addr) and nm:
+        if contains_house_number(nm) or re.search(r'д\.\s*\d+', nm, re.IGNORECASE):
+            addr = f"{addr}, {nm}"
+            nm = ""
+        elif re.search(r'«[^»]*»', nm):
+            pass
+        else:
+            pass
+
+    if addr and not contains_house_number(addr):
+        orig_addr = address or ""
+        match = re.search(r'д\.\s*(\d+[а-я]?)', orig_addr, re.IGNORECASE)
+        if match:
+            addr += f", д. {match.group(1)}"
+
+    if not addr and nm:
+        pass
+    elif not nm and not addr:
+        nm = ""
+
+    return addr, nm
+
+def format_spot_line(index, name, address, password):
+    addr, nm = extract_address_and_name(name, address, password)
+    if addr and nm:
+        line = f"{index}. Адрес: {addr} — {nm}\n"
+    elif addr:
+        line = f"{index}. Адрес: {addr}\n"
+    elif nm:
+        line = f"{index}. {nm}\n"
+    else:
+        line = f"{index}. Без названия\n"
+    if password and password.strip():
+        line += f"   Пароль: {password.strip()}\n"
+    return line
+
+# ---------------------------------------------------------------------------
 # Обработчики событий
 # ---------------------------------------------------------------------------
 @dp.bot_started()
@@ -104,19 +193,14 @@ async def on_bot_started(event: BotStarted):
     chat_id = get_chat_id(event)
     await bot.send_message(
         chat_id=chat_id,
-        text="Привет! Я чат-бот общедоступных Wi-Fi точек.\n\n"
-             "Я могу помочь вам:\n"
-             "- найти список Wi-Fi точек\n"
-             "- открыть карту с точками\n"
-             "- узнать, как подключиться к Wi-Fi\n\n"
-             "Если что-то пойдёт не так, просто отправьте команду /start.",
+        text=WELCOME_TEXT,
         attachments=[build_main_menu()]
     )
 
 @dp.message_created(CommandStart())
 async def cmd_start(event: MessageCreated):
     await event.message.answer(
-        "Главное меню:",
+        text=WELCOME_TEXT,
         attachments=[build_main_menu()]
     )
 
@@ -141,21 +225,15 @@ async def handle_callback(event: MessageCallback):
 
         msg = f"Список Wi-Fi точек (с {start_idx+1} по {end_idx}):\n\n"
         for i, spot in enumerate(group, start_idx+1):
-            name, address, password, instructions = spot
-            msg += f"{i}. {name}\n"
-            msg += f"   Адрес: {address}\n"
-            if password:
-                msg += f"   Пароль: {password}\n"
-            msg += f"   Инструкция: {instructions}\n\n"
+            name, address, password, _ = spot
+            msg += format_spot_line(i, name, address, password)
 
-        # Редактируем текущее сообщение вместо удаления и отправки нового
         try:
             await event.message.edit(
                 text=msg,
                 attachments=[build_pagination_keyboard(page, total_pages)]
             )
         except Exception:
-            # fallback: если edit не работает, отправляем новое (но с очисткой)
             try:
                 await event.message.delete()
             except Exception:
@@ -175,12 +253,8 @@ async def handle_callback(event: MessageCallback):
 
         msg = f"Список Wi-Fi точек (с 1 по {end_idx}):\n\n"
         for i, spot in enumerate(group, 1):
-            name, address, password, instructions = spot
-            msg += f"{i}. {name}\n"
-            msg += f"   Адрес: {address}\n"
-            if password:
-                msg += f"   Пароль: {password}\n"
-            msg += f"   Инструкция: {instructions}\n\n"
+            name, address, password, _ = spot
+            msg += format_spot_line(i, name, address, password)
 
         try:
             await event.message.edit(
@@ -219,7 +293,7 @@ async def handle_callback(event: MessageCallback):
     elif data == "main_menu":
         try:
             await event.message.edit(
-                text="Главное меню:",
+                text=WELCOME_TEXT,
                 attachments=[build_main_menu()]
             )
         except Exception:
@@ -228,7 +302,7 @@ async def handle_callback(event: MessageCallback):
             except Exception:
                 pass
             await event.message.answer(
-                "Главное меню:",
+                text=WELCOME_TEXT,
                 attachments=[build_main_menu()]
             )
 
@@ -239,7 +313,7 @@ async def handle_all_messages(event: MessageCreated):
         text = message_body.text.strip()
         if text in ('/start', '/help'):
             await event.message.answer(
-                "Главное меню:",
+                text=WELCOME_TEXT,
                 attachments=[build_main_menu()]
             )
             return
@@ -257,7 +331,17 @@ async def main():
     print(f"Точек в базе: {cursor.execute('SELECT COUNT(*) FROM wifi_spots').fetchone()[0]}")
     print("=" * 50)
     await bot.delete_webhook()
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nБот остановлен.")
+    finally:
+        if hasattr(bot, 'session') and bot.session:
+            await bot.session.close()
+        print("Соединения закрыты.")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Остановка по требованию пользователя.")
